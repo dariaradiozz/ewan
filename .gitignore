@@ -1,0 +1,12 @@
+.env
+node_modules/
+dist/
+*.traineddata
+.env.save
+.env_
+*.backup
+bot.lock
+.env.save
+.env_
+*.backup
+bot.lock

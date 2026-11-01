@@ -1,0 +1,756 @@
+import 'dotenv/config';
+import { Client, Message, MessageEmbed, PartialMessage } from 'discord.js-selfbot-v13';
+import { createWorker } from 'tesseract.js';
+import { POKEMON_DATA } from './pokemon-data.js';
+import fs from 'fs';
+import path from 'path';
+
+// ── Shared constants ──────────────────────────────────────────────────────────
+const MIN_DELAY = 1000;
+const MAX_DELAY = 3000;
+const POKETWO_BOT_ID = '716390085896962058';
+const POKENAME_USERNAME_FRAGMENTS = ['poke-name', 'pokéname', 'pokename', 'poké-name'];
+const SPAWN_WINDOW_MS = 20_000;
+
+const ALL_POKEMON_NAMES = Object.values(POKEMON_DATA);
+const POKEMON_BY_NAME = new Map<string, number>(
+  Object.entries(POKEMON_DATA).map(([id, name]) => [name, parseInt(id)])
+);
+
+// ── Shared OCR worker (one instance, shared across all accounts) ──────────────
+let ocrWorker: Awaited<ReturnType<typeof createWorker>> | null = null;
+async function getOcrWorker() {
+  if (!ocrWorker) {
+    ocrWorker = await createWorker('eng', 1, { logger: () => {} });
+  }
+  return ocrWorker;
+}
+
+// ── OCR corrections (shared across all accounts, learns from all of them) ─────
+const CORRECTIONS_FILE = path.join(process.cwd(), 'src', 'ocr-corrections.json');
+let ocrCorrections: Record<string, string> = {};
+
+function loadCorrections() {
+  try {
+    ocrCorrections = JSON.parse(fs.readFileSync(CORRECTIONS_FILE, 'utf8'));
+    const count = Object.keys(ocrCorrections).length;
+    if (count > 0) console.log(`[LEARN] Loaded ${count} OCR corrections`);
+  } catch { /* file doesn't exist yet — start fresh */ }
+}
+
+function saveCorrections() {
+  fs.writeFileSync(CORRECTIONS_FILE, JSON.stringify(ocrCorrections, null, 2));
+}
+
+function ocrWords(raw: string): string[] {
+  return raw.toLowerCase().replace(/[^a-z ]/g, ' ').split(/\s+/).filter((w) => w.length >= 4);
+}
+
+function learnCorrection(rawOcr: string, correctName: string) {
+  const words = ocrWords(rawOcr);
+  let learned = false;
+  for (const word of words) {
+    // Always overwrite — confirmed correct name takes priority over any existing entry
+    if (ocrCorrections[word] !== correctName) {
+      if (ocrCorrections[word]) {
+        console.log(`[LEARN] Updating: "${word}" was "${ocrCorrections[word]}" → now "${correctName}"`);
+      }
+      ocrCorrections[word] = correctName;
+      learned = true;
+    }
+  }
+  if (learned) {
+    saveCorrections();
+    console.log(`[LEARN] Saved: [${words.join(', ')}] → ${correctName}`);
+  }
+}
+
+function checkCorrections(rawOcr: string): string | null {
+  for (const word of ocrWords(rawOcr)) {
+    const hit = ocrCorrections[word];
+    if (hit) {
+      console.log(`[LEARN] Correction hit: "${word}" → ${hit}`);
+      return hit;
+    }
+  }
+  return null;
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+function randomDelay(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function matchPokemonName(raw: string): string | null {
+  const cleaned = raw
+    .toLowerCase()
+    .replace(/[^a-z\- ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  for (const name of ALL_POKEMON_NAMES) {
+    const pattern = new RegExp(`\\b${name.replace(/-/g, '[- ]?')}\\b`);
+    if (pattern.test(cleaned)) return name;
+  }
+  return null;
+}
+
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] =
+        a[i - 1] === b[j - 1]
+          ? dp[i - 1][j - 1]
+          : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+function fuzzyMatchPokemon(raw: string): string | null {
+  const words = raw
+    .toLowerCase()
+    .replace(/[^a-z ]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3);
+  let best: { name: string; dist: number } | null = null;
+  for (const name of ALL_POKEMON_NAMES) {
+    const maxDist = name.length <= 5 ? 1 : name.length <= 9 ? 2 : 3;
+    for (const word of words) {
+      if (Math.abs(word.length - name.length) > maxDist) continue;
+      const dist = levenshtein(word, name);
+      if (dist <= maxDist && (!best || dist < best.dist)) {
+        best = { name, dist };
+      }
+    }
+  }
+  if (best) console.log(`[FUZZY] "${raw.trim().slice(0, 60)}" → ${best.name} (dist=${best.dist})`);
+  return best?.name ?? null;
+}
+
+function isSpawnEmbed(embed: MessageEmbed): boolean {
+  const title = (embed.title ?? '').toLowerCase();
+  const desc = (embed.description ?? '').toLowerCase();
+  return (
+    title.includes('wild') ||
+    desc.includes('wild') ||
+    title.includes('pokémon has appeared') ||
+    title.includes('pokemon has appeared') ||
+    title.includes('has appeared')
+  );
+}
+
+function isCaptchaMessage(message: Message): boolean {
+  const content = (message.content ?? '').toLowerCase();
+  const embed = message.embeds[0];
+  const embedTitle = (embed?.title ?? '').toLowerCase();
+  const embedDesc = (embed?.description ?? '').toLowerCase();
+  return (
+    content.includes('captcha') ||
+    content.includes('suspicious') ||
+    embedTitle.includes('captcha') ||
+    embedTitle.includes('verify') ||
+    embedDesc.includes('captcha') ||
+    embedDesc.includes('verify') ||
+    embedDesc.includes('suspicious')
+  );
+}
+
+function isPokeName(message: Message): boolean {
+  const username = (message.author.username ?? '').toLowerCase();
+  return POKENAME_USERNAME_FRAGMENTS.some((frag) => username.includes(frag));
+}
+
+function matchHintPattern(hint: string): string[] {
+  const pattern = new RegExp(
+    '^' + hint.toLowerCase().replace(/[^a-z_\-]/g, '').replace(/_/g, '.') + '$'
+  );
+  const matches = ALL_POKEMON_NAMES.filter((name) => pattern.test(name));
+  console.log(`[HINT] "${hint}" → ${matches.length} match(es): ${matches.join(', ') || 'none'}`);
+  return matches;
+}
+
+// Returns the matched name AND the raw OCR text (even on direct match) so the
+// caller can always store it in lastOcrByChannel for learning later.
+async function readNameFromPokeNameMessage(
+  message: Message
+): Promise<{ name: string | null; rawOcr: string }> {
+  const embed = message.embeds[0];
+
+  const contentMatch = matchPokemonName(message.content ?? '');
+  if (contentMatch) {
+    console.log(`[POKENAME] Name from content: ${contentMatch}`);
+    return { name: contentMatch, rawOcr: '' };
+  }
+
+  if (embed) {
+    const titleMatch = matchPokemonName(embed.title ?? '');
+    if (titleMatch) {
+      console.log(`[POKENAME] Name from embed title: ${titleMatch}`);
+      return { name: titleMatch, rawOcr: '' };
+    }
+
+    const descMatch = matchPokemonName(embed.description ?? '');
+    if (descMatch) {
+      console.log(`[POKENAME] Name from embed description: ${descMatch}`);
+      return { name: descMatch, rawOcr: '' };
+    }
+
+    for (const field of embed.fields ?? []) {
+      const fieldMatch = matchPokemonName(`${field.name} ${field.value}`);
+      if (fieldMatch) {
+        console.log(`[POKENAME] Name from embed field: ${fieldMatch}`);
+        return { name: fieldMatch, rawOcr: '' };
+      }
+    }
+
+    const imageUrl = embed.image?.url ?? embed.thumbnail?.url ?? '';
+    if (imageUrl) {
+      console.log(`[POKENAME] OCR-ing card image: ${imageUrl}`);
+      try {
+        const { default: fetch } = await import('node-fetch');
+        const response = await fetch(imageUrl);
+        if (response.ok) {
+          const imgBuffer = Buffer.from(await response.arrayBuffer());
+          const worker = await getOcrWorker();
+          const allOcrText: string[] = [];
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          for (const psm of ['6', '3', '7', '11'] as any[]) {
+            await worker.setParameters({ tessedit_pageseg_mode: psm });
+            const { data } = await worker.recognize(imgBuffer);
+            const text = (data.text ?? '').trim();
+            console.log(`[OCR] PSM${psm}: "${text.slice(0, 100)}"`);
+            if (text) allOcrText.push(text);
+
+            const ocrMatch = matchPokemonName(text);
+            if (ocrMatch) {
+              // Return the raw OCR text even on a direct match so caller can
+              // store it for potential correction later via $learn
+              console.log(`[POKENAME] Name from OCR (PSM${psm}): ${ocrMatch}`);
+              return { name: ocrMatch, rawOcr: allOcrText.join(' ') };
+            }
+          }
+
+          const combined = allOcrText.join(' ');
+
+          // Check learned corrections before fuzzy
+          const correction = checkCorrections(combined);
+          if (correction) return { name: correction, rawOcr: combined };
+
+          const fuzzyMatch = fuzzyMatchPokemon(combined);
+          if (fuzzyMatch) {
+            console.log(`[POKENAME] Name from fuzzy OCR: ${fuzzyMatch}`);
+            return { name: fuzzyMatch, rawOcr: combined };
+          }
+
+          return { name: null, rawOcr: combined };
+        }
+      } catch (err) {
+        console.error('[OCR] Error:', err);
+      }
+    }
+  }
+
+  return { name: null, rawOcr: '' };
+}
+
+// ── Bot factory — one instance per account ────────────────────────────────────
+function createBot(token: string, channelIds: string[], name: string) {
+  const tag = `[BOT:${name}]`;
+
+  // Per-account state
+  const pendingSpawns = new Map<
+    string,
+    { timestamp: number; send: (text: string) => Promise<unknown> }
+  >();
+  const pendingHints = new Map<string, (text: string) => Promise<unknown>>();
+  // Last raw OCR text per channel — used for $learn and auto-learning on wrong catches
+  const lastOcrByChannel = new Map<string, string>();
+
+  // Live channel objects (in-memory, rebuilt each session as messages arrive)
+  const activePoketwoChannels = new Map<string, Message['channel']>();
+
+  // Persistent channel ID set — saved to disk so $incresume works after restarts
+  const ACTIVE_CHANNELS_FILE = path.join(process.cwd(), 'src', `active-channels-${name}.json`);
+  const savedChannelIds = new Set<string>();
+
+  function loadActiveChannels() {
+    try {
+      const ids: string[] = JSON.parse(fs.readFileSync(ACTIVE_CHANNELS_FILE, 'utf8'));
+      ids.forEach((id) => savedChannelIds.add(id));
+      if (savedChannelIds.size > 0)
+        console.log(`${tag} Loaded ${savedChannelIds.size} remembered channel(s)`);
+    } catch { /* no file yet — start fresh */ }
+  }
+
+  function saveActiveChannels() {
+    fs.writeFileSync(ACTIVE_CHANNELS_FILE, JSON.stringify([...savedChannelIds], null, 2));
+  }
+
+  function trackChannel(channelId: string, channel: Message['channel']) {
+    activePoketwoChannels.set(channelId, channel);
+    if (!savedChannelIds.has(channelId)) {
+      savedChannelIds.add(channelId);
+      saveActiveChannels();
+      console.log(`${tag} Remembered new channel ch=${channelId} (total: ${savedChannelIds.size})`);
+    }
+  }
+
+  let paused = false;
+  let dotMode = false;
+  let caughtCount = 0;
+  let lastCaught = 'none';
+  const missedList: string[] = [];
+
+  async function doCatch(
+    name: string,
+    channelId: string,
+    send: (text: string) => Promise<unknown>
+  ) {
+    const delay = randomDelay(MIN_DELAY, MAX_DELAY);
+    console.log(`${tag} [CATCH] ${name} in ch=${channelId} — sending in ${delay}ms`);
+    await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    try {
+      await send(`<@${POKETWO_BOT_ID}> c ${name}`);
+      caughtCount++;
+      lastCaught = name;
+      console.log(`${tag} [CAUGHT] ${name} (total: ${caughtCount})`);
+      if (dotMode) {
+        await new Promise<void>((resolve) => setTimeout(resolve, randomDelay(300, 800)));
+        await send('.');
+        console.log(`${tag} [DOT] Sent dot after catching ${name}`);
+      }
+    } catch (err) {
+      console.error(`${tag} [ERROR] Failed to catch ${name}:`, err);
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const client = new Client({ checkUpdate: false } as any);
+
+  client.on('ready', () => {
+    loadActiveChannels();
+    console.log(`${tag} Logged in as ${client.user?.tag}`);
+    console.log(`${tag} Watching ${channelIds.length > 0 ? channelIds.join(', ') : 'all channels'}`);
+    console.log(`${tag} Delay: ${MIN_DELAY}ms – ${MAX_DELAY}ms`);
+    void getOcrWorker().then(() => console.log(`${tag} OCR worker ready`));
+  });
+
+  client.on('messageCreate', async (message: Message) => {
+    const isSelf = message.author.id === client.user?.id;
+
+    // ── Commands (only respond to messages from this account) ─────────────────
+    if (isSelf) {
+      const cmd = message.content.trim().toLowerCase();
+
+      if (cmd === '$pause') {
+        paused = true;
+        console.log(`${tag} Paused`);
+        await message.channel.send(`⏸ Account **${name}** autocatcher paused.`);
+        return;
+      }
+      if (cmd === '$resume') {
+        paused = false;
+        console.log(`${tag} Resumed`);
+        await message.channel.send(`▶️ Account **${name}** autocatcher resumed.`);
+        return;
+      }
+      if (cmd === '$status') {
+        const state = paused ? '⏸ Paused' : '▶️ Active';
+        await message.channel.send(
+          `**Account ${name} Status**\nState: ${state}\nDot mode: ${dotMode ? '🟢 ON' : '🔴 OFF'}\nCaught this session: **${caughtCount}**\nMissed this session: **${missedList.length}**\nLast caught: **${lastCaught}**`
+        );
+        return;
+      }
+      if (cmd === '$missed') {
+        if (missedList.length === 0) {
+          await message.channel.send(`✅ Account **${name}**: No Pokémon missed this session!`);
+        } else {
+          const lines = missedList.map((n, i) => `${i + 1}. ${n}`).join('\n');
+          await message.channel.send(
+            `**Account ${name} missed (${missedList.length}):**\n${lines}`
+          );
+        }
+        return;
+      }
+      if (cmd === '$corrections') {
+        const entries = Object.entries(ocrCorrections);
+        if (entries.length === 0) {
+          await message.channel.send('📖 No OCR corrections learned yet.');
+        } else {
+          const lines = entries.map(([ocr, name]) => `\`${ocr}\` → **${name}**`).join('\n');
+          const chunks = lines.match(/[\s\S]{1,1800}/g) ?? [];
+          for (let i = 0; i < chunks.length; i++) {
+            const header = i === 0 ? `**Learned OCR corrections (${entries.length}):**\n` : '';
+            await message.channel.send(header + chunks[i]);
+          }
+        }
+        return;
+      }
+      // $learn <pokemon-name> — manually teach the bot what the last OCR should have been
+      if (cmd.startsWith('$learn ')) {
+        const pokemonName = cmd.slice(7).trim();
+        if (!POKEMON_BY_NAME.has(pokemonName)) {
+          await message.channel.send(`❌ Unknown Pokémon: **${pokemonName}**. Check the spelling (all lowercase, e.g. \`$learn pikachu\`).`);
+          return;
+        }
+        const lastOcr = lastOcrByChannel.get(message.channelId);
+        if (!lastOcr) {
+          await message.channel.send(`❌ No recent OCR text in this channel to learn from.`);
+          return;
+        }
+        learnCorrection(lastOcr, pokemonName);
+        lastOcrByChannel.delete(message.channelId);
+        await message.channel.send(`✅ Learned: last OCR in this channel → **${pokemonName}**`);
+        return;
+      }
+      // $dot — toggle sending "." after every catch (helps trigger more spawns)
+      if (cmd === '$dot') {
+        dotMode = !dotMode;
+        console.log(`${tag} Dot mode ${dotMode ? 'ON' : 'OFF'}`);
+        await message.channel.send(
+          dotMode
+            ? '🟢 Dot mode **ON** — sending `.` after every catch.'
+            : '🔴 Dot mode **OFF** — no longer sending `.` after catches.'
+        );
+        return;
+      }
+      // $help — list all commands
+      if (cmd === '$help') {
+        await message.channel.send(
+          `**PokeTwo Autocatcher — Commands (Account ${name})**\n\n` +
+          `**Catching**\n` +
+          `\`$pause\` — Stop catching Pokémon\n` +
+          `\`$resume\` — Resume catching Pokémon\n` +
+          `\`$dot\` — Toggle sending \`.\` after every catch (on/off)\n` +
+          `\`$status\` — Show current state, dot mode, caught/missed counts\n` +
+          `\`$missed\` — List Pokémon missed this session\n\n` +
+          `**Captcha / Incense**\n` +
+          `\`$incpause\` — Send \`inc p\` to ALL remembered channels (pause incense everywhere)\n` +
+          `\`$incresume\` — Send \`inc r\` to ALL remembered channels + resume bot (use after solving captcha)\n\n` +
+          `**Channels**\n` +
+          `\`$channels\` — List all remembered channels\n` +
+          `\`$clearchannels\` — Wipe the remembered channel list\n\n` +
+          `**OCR Learning**\n` +
+          `\`$corrections\` — Show all learned OCR corrections\n` +
+          `\`$learn <name>\` — Teach the bot the correct Pokémon for the last OCR in this channel (e.g. \`$learn pikachu\`)\n` +
+          `\`$forget <word>\` — Remove a specific OCR correction entry (e.g. \`$forget bramelin\`)`
+        );
+        return;
+      }
+      // $incpause — send "inc p" to every remembered channel (manual pause incense everywhere)
+      if (cmd === '$incpause') {
+        if (savedChannelIds.size === 0) {
+          await message.channel.send('❌ No channels remembered yet. The bot needs to see at least one PokeTwo spawn first.');
+          return;
+        }
+        paused = true;
+        console.log(`${tag} [INCPAUSE] Pausing incense in ${savedChannelIds.size} channel(s)...`);
+        let sent = 0;
+        let failed = 0;
+        for (const chId of savedChannelIds) {
+          try {
+            const ch = activePoketwoChannels.get(chId)
+              ?? await client.channels.fetch(chId) as Message['channel'] | null;
+            if (ch && 'send' in ch) {
+              await (ch as Message['channel']).send(`<@${POKETWO_BOT_ID}> inc p`);
+              sent++;
+              console.log(`${tag} [INCPAUSE] Sent inc p to ch=${chId}`);
+              await new Promise<void>((resolve) => setTimeout(resolve, 600));
+            }
+          } catch (err) {
+            failed++;
+            console.error(`${tag} [INCPAUSE] Failed for ch=${chId}:`, err);
+          }
+        }
+        await message.channel.send(
+          `⏸ Account **${name}** paused.\n✅ Sent \`inc p\` to **${sent}** channel(s)${failed > 0 ? ` (${failed} failed)` : ''}.`
+        );
+        return;
+      }
+      // $incresume — send "inc r" to every remembered channel, then resume bot
+      if (cmd === '$incresume') {
+        if (savedChannelIds.size === 0) {
+          await message.channel.send('❌ No channels remembered yet. The bot needs to see at least one PokeTwo spawn first.');
+          return;
+        }
+        paused = false;
+        console.log(`${tag} [INCRESUME] Resuming incense in ${savedChannelIds.size} channel(s)...`);
+        let sent = 0;
+        let failed = 0;
+        for (const chId of savedChannelIds) {
+          try {
+            const ch = activePoketwoChannels.get(chId)
+              ?? await client.channels.fetch(chId) as Message['channel'] | null;
+            if (ch && 'send' in ch) {
+              await (ch as Message['channel']).send(`<@${POKETWO_BOT_ID}> inc r`);
+              sent++;
+              console.log(`${tag} [INCRESUME] Sent inc r to ch=${chId}`);
+              // Small delay between each send to avoid rate limits
+              await new Promise<void>((resolve) => setTimeout(resolve, 600));
+            }
+          } catch (err) {
+            failed++;
+            console.error(`${tag} [INCRESUME] Failed for ch=${chId}:`, err);
+          }
+        }
+        await message.channel.send(
+          `▶️ Account **${name}** resumed.\n✅ Sent \`inc r\` to **${sent}** channel(s)${failed > 0 ? ` (${failed} failed)` : ''}.`
+        );
+        return;
+      }
+      // $channels — list all remembered channels
+      if (cmd === '$channels') {
+        if (savedChannelIds.size === 0) {
+          await message.channel.send('📭 No channels remembered yet.');
+          return;
+        }
+        const lines = [...savedChannelIds].map((id) => `<#${id}>`).join('\n');
+        await message.channel.send(
+          `**Account ${name} — remembered channels (${savedChannelIds.size}):**\n${lines}`
+        );
+        return;
+      }
+      // $clearchannels — wipe the remembered channel list
+      if (cmd === '$clearchannels') {
+        const count = savedChannelIds.size;
+        savedChannelIds.clear();
+        saveActiveChannels();
+        await message.channel.send(`🗑️ Cleared ${count} remembered channel(s).`);
+        return;
+      }
+      // $forget <word> — remove a specific OCR correction entry
+      if (cmd.startsWith('$forget ')) {
+        const word = cmd.slice(8).trim();
+        if (ocrCorrections[word]) {
+          const old = ocrCorrections[word];
+          delete ocrCorrections[word];
+          saveCorrections();
+          await message.channel.send(`🗑️ Removed correction: \`${word}\` → ~~${old}~~`);
+        } else {
+          await message.channel.send(`❌ No correction found for \`${word}\`.`);
+        }
+        return;
+      }
+      return;
+    }
+
+    // ── Pokétwo messages ───────────────────────────────────────────────────────
+    if (message.author.id === POKETWO_BOT_ID) {
+      const embed = message.embeds[0];
+      trackChannel(message.channelId, message.channel);
+
+      console.log(
+        `${tag} [POKETWO] ch=${message.channelId} embeds=${message.embeds.length} "${message.content.slice(0, 60)}"`
+      );
+      if (embed) {
+        console.log(`${tag} [POKETWO] title="${embed.title}" desc="${(embed.description ?? '').slice(0, 80)}"`);
+      }
+
+      // Captcha — pause and stop incense on all active channels
+      if (isCaptchaMessage(message)) {
+        paused = true;
+        console.log(`${tag} [CAPTCHA] Detected! Pausing.`);
+        for (const [chId, ch] of activePoketwoChannels) {
+          try {
+            await ch.send(`<@${POKETWO_BOT_ID}> inc p`);
+            console.log(`${tag} [CAPTCHA] Sent inc p to ch=${chId}`);
+          } catch {}
+        }
+        return;
+      }
+
+      // Wrong catch — request a hint
+      if (
+        message.content.toLowerCase().includes('wrong pokémon') ||
+        message.content.toLowerCase().includes('wrong pokemon')
+      ) {
+        console.log(`${tag} [WRONG] Wrong catch in ch=${message.channelId} — requesting hint`);
+        pendingHints.set(message.channelId, (text) => message.channel.send(text));
+        try {
+          await message.channel.send(`<@${POKETWO_BOT_ID}> hint`);
+        } catch (err) {
+          console.error(`${tag} [HINT] Failed to send hint request:`, err);
+        }
+        return;
+      }
+
+      // Hint response
+      const hintSend = pendingHints.get(message.channelId);
+      if (hintSend) {
+        const hintContent = message.content.replace(/\\_/g, '_');
+        const hintMatch = hintContent.match(/the pok[eé]mon is ([A-Za-z_\-]+)/i);
+        if (hintMatch) {
+          const hintStr = hintMatch[1];
+          console.log(`${tag} [HINT] Got hint: "${hintStr}"`);
+          const candidates = matchHintPattern(hintStr);
+          if (candidates.length === 1) {
+            pendingHints.delete(message.channelId);
+            // The hint confirmed the real name — update any wrong OCR correction
+            const lastOcr = lastOcrByChannel.get(message.channelId);
+            if (lastOcr) {
+              learnCorrection(lastOcr, candidates[0]);
+              lastOcrByChannel.delete(message.channelId);
+            }
+            await doCatch(candidates[0], message.channelId, hintSend);
+          } else if (candidates.length > 1) {
+            console.log(`${tag} [HINT] Ambiguous (${candidates.length} candidates) — requesting another hint`);
+            try {
+              await message.channel.send(`<@${POKETWO_BOT_ID}> hint`);
+            } catch (err) {
+              console.error(`${tag} [HINT] Failed to send follow-up hint:`, err);
+              pendingHints.delete(message.channelId);
+              await doCatch(candidates[0], message.channelId, hintSend);
+            }
+          } else {
+            pendingHints.delete(message.channelId);
+            console.log(`${tag} [HINT] No Pokémon matched hint "${hintStr}"`);
+          }
+          return;
+        }
+      }
+
+      if (paused) return;
+      if (channelIds.length > 0 && !channelIds.includes(message.channelId)) return;
+
+      // "Wild X fled" — learn if we had OCR for this channel
+      if (embed) {
+        const fledMatch = (embed.title ?? '').match(/^Wild (.+?) fled\./i);
+        if (fledMatch) {
+          const missedName = fledMatch[1].toLowerCase();
+          missedList.push(missedName);
+          console.log(`${tag} [MISSED] ${missedName} (total missed: ${missedList.length})`);
+          const lastOcr = lastOcrByChannel.get(message.channelId);
+          if (lastOcr) {
+            learnCorrection(lastOcr, missedName);
+            lastOcrByChannel.delete(message.channelId);
+          }
+        }
+      }
+
+      // Spawn — wait for Poké-Name
+      if (embed && isSpawnEmbed(embed)) {
+        console.log(`${tag} [SPAWN] Pokétwo spawn in ch=${message.channelId} — waiting for Poké-Name...`);
+        pendingSpawns.set(message.channelId, {
+          timestamp: Date.now(),
+          send: (text) => message.channel.send(text),
+        });
+        setTimeout(() => {
+          const entry = pendingSpawns.get(message.channelId);
+          if (entry && Date.now() - entry.timestamp >= SPAWN_WINDOW_MS) {
+            pendingSpawns.delete(message.channelId);
+            console.log(`${tag} [SPAWN] Window expired for ch=${message.channelId}`);
+          }
+        }, SPAWN_WINDOW_MS);
+      }
+      return;
+    }
+
+    // ── Poké-Name bot messages ─────────────────────────────────────────────────
+    if (isPokeName(message)) {
+      const channelId = message.channelId;
+      console.log(`${tag} [POKENAME] Message in ch=${channelId} from ${message.author.username}`);
+
+      const pending = pendingSpawns.get(channelId);
+      if (!pending) {
+        console.log(`${tag} [POKENAME] No pending spawn — skipping`);
+        return;
+      }
+      if (paused) {
+        pendingSpawns.delete(channelId);
+        return;
+      }
+      pendingSpawns.delete(channelId);
+
+      const { name, rawOcr } = await readNameFromPokeNameMessage(message);
+
+      // Always store raw OCR so $learn and auto-learning can use it
+      if (rawOcr) lastOcrByChannel.set(channelId, rawOcr);
+
+      if (!name) {
+        console.log(`${tag} [POKENAME] Could not read Pokémon name — recording as missed`);
+        missedList.push('unknown (OCR failed)');
+        return;
+      }
+
+      await doCatch(name, channelId, pending.send);
+    }
+  });
+
+  client.on(
+    'messageUpdate',
+    async (_old: Message | PartialMessage, message: Message | PartialMessage) => {
+      if (message.author?.id !== POKETWO_BOT_ID) return;
+      if (paused) return;
+      if (channelIds.length > 0 && !channelIds.includes(message.channelId)) return;
+      const embed = message.embeds[0];
+      if (!embed || !isSpawnEmbed(embed)) return;
+      if (!pendingSpawns.has(message.channelId)) {
+        console.log(`${tag} [SPAWN/EDIT] Updated spawn in ch=${message.channelId}`);
+        trackChannel(message.channelId, message.channel as Message['channel']);
+        pendingSpawns.set(message.channelId, {
+          timestamp: Date.now(),
+          send: (text) => (message.channel as Message['channel']).send(text),
+        });
+      }
+    }
+  );
+
+  client.login(token).catch((err: Error) => {
+    console.error(`${tag} [ERROR] Login failed:`, err.message);
+  });
+
+  return client;
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+loadCorrections();
+
+// Collect accounts from env vars.
+//
+// Supported formats (can be mixed):
+//   DISCORD_TOKEN              → plain single account (name: "MAIN")
+//   DISCORD_TOKEN_BARUSU       → named account (name: "BARUSU")
+//   DISCORD_TOKEN_1            → numbered account (name: "1")
+//   DISCORD_TOKEN_ALT2         → any suffix works
+//
+// Each token can have a matching CHANNEL_IDS_<suffix> (comma-separated channel IDs).
+// If CHANNEL_IDS_<suffix> is not set the account watches all channels.
+
+const accounts: { token: string; channelIds: string[]; name: string }[] = [];
+
+// Scan all env vars for anything starting with DISCORD_TOKEN_
+const tokenEntries = Object.entries(process.env)
+  .filter(([key, val]) => key.startsWith('DISCORD_TOKEN_') && !!val)
+  .sort(([a], [b]) => a.localeCompare(b)); // alphabetical, consistent order
+
+for (const [key, token] of tokenEntries) {
+  const suffix = key.slice('DISCORD_TOKEN_'.length); // e.g. "BARUSU", "1", "ALT2"
+  const raw = process.env[`CHANNEL_IDS_${suffix}`] ?? '';
+  const channelIds = raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  accounts.push({ token: token!, channelIds, name: suffix });
+}
+
+// Fallback: plain DISCORD_TOKEN with no suffix
+if (process.env.DISCORD_TOKEN) {
+  const raw = process.env.CHANNEL_IDS ?? '';
+  const channelIds = raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  accounts.push({ token: process.env.DISCORD_TOKEN, channelIds, name: 'MAIN' });
+}
+
+if (accounts.length === 0) {
+  console.error(
+    '[ERROR] No tokens found.\n' +
+    'Set DISCORD_TOKEN for a single account, or DISCORD_TOKEN_<name> for named/multiple accounts.\n' +
+    'Examples: DISCORD_TOKEN_BARUSU, DISCORD_TOKEN_ALT, DISCORD_TOKEN_1'
+  );
+  process.exit(1);
+}
+
+console.log(`[BOT] Starting ${accounts.length} account(s): ${accounts.map((a) => a.name).join(', ')}`);
+accounts.forEach((account) => {
+  createBot(account.token, account.channelIds, account.name);
+});
